@@ -82,6 +82,7 @@ for ab_id, label in [
 for oe_id, label in [
     (state.get("online_eval_id"), "v1"),
     (state.get("online_eval_v2_id"), "v2"),
+    (state.get("online_eval_v1t_id"), "v1-target"),
 ]:
     if not oe_id:
         continue

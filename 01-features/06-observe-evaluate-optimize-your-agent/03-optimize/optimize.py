@@ -117,10 +117,270 @@ ONLINE_EVAL_ID = None
 ONLINE_EVAL_ARN = None
 ONLINE_EVAL_V2_ID = None
 ONLINE_EVAL_V2_ARN = None
+ONLINE_EVAL_V1T_ID = None
+ONLINE_EVAL_V1T_ARN = None
 ABTEST_BUNDLE_ID = None
 ABTEST_TARGET_ID = None
 DELIVERY_ID = None
 DELIVERY_SOURCE_NAME = f"hr-gw-traces-{SUFFIX}"
+
+
+# ── A/B analysis: polling, reporting, and decision rules ─────────────────
+#
+# An A/B analysis is published asynchronously and republished as more sessions
+# are evaluated, so "the result" is a moving target. Two consequences shape the
+# helpers below.
+#
+# First, the earliest analysis a test exposes need not describe that test's
+# traffic at all. A test can publish an analysis within a minute of starting,
+# before any of its own sessions could have been ingested, assembled from
+# sessions an evaluation config already held. Accepting the first analysis that
+# exists therefore reports some other population's numbers as this test's
+# result.
+#
+# Second, the analysis keeps changing after this script stops reading it. The
+# console shows the latest one, so a figure printed here and a figure read in
+# the console minutes later can legitimately disagree. Waiting for the sample
+# to stop growing, and saying which analysis a number came from, is what makes
+# the two reconcilable.
+
+AB_POLL_ATTEMPTS = 25
+AB_POLL_INTERVAL_SECONDS = 60
+
+# Consecutive polls returning the same analysis after which the service is
+# taken to have stopped republishing. Analyses can arrive many minutes apart,
+# so without this the script would wait out its whole budget whenever the
+# population cannot be confirmed any other way.
+AB_SETTLE_QUIET_POLLS = 3
+
+# Sessions per arm below which no rollout recommendation is worth printing. A
+# 10% canary arm in a workshop-sized run collects single digits, far under this
+# floor. That is expected: the script reports the sample as too small rather
+# than dressing up noise as a decision.
+AB_ACTION_MIN_SAMPLE_PER_ARM = 20
+
+
+def _fmt(value, spec=""):
+    """Format a figure the service may not have published."""
+    if value is None:
+        return "n/a"
+    return format(value, spec) if spec else str(value)
+
+
+def _analysis_session_count(results):
+    """Sessions in the analysis population, not double counted per evaluator.
+
+    Every evaluator scores the same sessions, so adding sample sizes across
+    evaluators counts each session once per evaluator. The console's session
+    counters show exactly that multiplication: with the two evaluators
+    configured here they read twice the sample sizes the API reports. Take the
+    largest per-evaluator population instead.
+    """
+    totals = []
+    for metric in results.get("evaluatorMetrics", []):
+        control_n = metric.get("controlStats", {}).get("sampleSize")
+        variant_n = [v.get("sampleSize") for v in metric.get("variantResults", [])]
+        if control_n is None or not variant_n or any(n is None for n in variant_n):
+            continue
+        totals.append(control_n + sum(variant_n))
+    return max(totals) if totals else None
+
+
+def _analysis_signature(results):
+    """Identify one published analysis by its timestamp and its arm sizes."""
+    sizes = []
+    for metric in results.get("evaluatorMetrics", []):
+        sizes.append(metric.get("controlStats", {}).get("sampleSize"))
+        sizes.extend(v.get("sampleSize") for v in metric.get("variantResults", []))
+    return (results.get("analysisTimestamp"), tuple(sizes))
+
+
+def _analysis_covers_traffic(results, traffic_ended, sessions_sent):
+    """Judge whether a published analysis can be this test's own result.
+
+    Returns (usable, note). `analysisTimestamp` records when the analysis ran,
+    not which sessions it covers, so the timestamp alone cannot settle this.
+    The sample size has to be consistent with the traffic that was sent too --
+    and a population larger than the traffic sent is positive evidence that
+    the analysis includes sessions from somewhere else.
+    """
+    if not results.get("evaluatorMetrics"):
+        return False, "no analysis published yet"
+    timestamp = results.get("analysisTimestamp")
+    if timestamp is None:
+        return False, "analysis carries no timestamp"
+    if timestamp.timestamp() < traffic_ended:
+        return False, "analysis was published before this test's traffic finished"
+    total = _analysis_session_count(results)
+    if total is None:
+        return False, "analysis reports no sample sizes"
+    if total > sessions_sent:
+        return True, (
+            f"WARNING: the analysis covers {total} sessions but this test sent {sessions_sent}, "
+            "so it includes sessions from outside this test."
+        )
+    if total < max(1, sessions_sent // 2):
+        return False, f"only {total} of {sessions_sent} sessions evaluated so far"
+    return True, ""
+
+
+def _print_analysis(results, control_label, treatment_label, verbose=False, indent="  "):
+    """Print an analysis with the provenance needed to reconcile it elsewhere."""
+    timestamp = results.get("analysisTimestamp")
+    print(f"{indent}analysisTimestamp: {timestamp if timestamp is not None else 'none'}")
+    sessions = _analysis_session_count(results)
+    if sessions is not None:
+        print(f"{indent}sessions in analysis: {sessions}")
+    for metric in results.get("evaluatorMetrics", []):
+        name = metric.get("evaluatorArn", "").split("/")[-1]
+        control = metric.get("controlStats", {})
+        for variant in metric.get("variantResults", []):
+            percent = variant.get("percentChange")
+            change = f"{percent:+.1f}%" if percent is not None else "n/a (not published)"
+            print(
+                f"{indent}{name}: "
+                f"{control_label} n={_fmt(control.get('sampleSize'))} "
+                f"mean={_fmt(control.get('mean'), '.4f')} | "
+                f"{treatment_label} n={_fmt(variant.get('sampleSize'))} "
+                f"mean={_fmt(variant.get('mean'), '.4f')} | "
+                f"change={change} p={_fmt(variant.get('pValue'), '.4f')} "
+                f"significant={_fmt(variant.get('isSignificant'))}"
+            )
+            if verbose:
+                interval = variant.get("confidenceInterval") or {}
+                bounds = (
+                    f"[{_fmt(interval.get('lower'), '+.4f')}, {_fmt(interval.get('upper'), '+.4f')}]"
+                    if interval
+                    else "n/a"
+                )
+                print(
+                    f"{indent}    absoluteChange={_fmt(variant.get('absoluteChange'), '+.4f')}"
+                    f"  confidenceInterval={bounds}"
+                )
+
+
+def _print_ab_followup(abtest_id):
+    """Tell the reader where the authoritative, still-moving figures live."""
+    print(f"\n  A/B test ID: {abtest_id}")
+    print("  The service republishes this analysis as more sessions are evaluated, so the")
+    print("  console shows the latest figures and they can differ from the ones above.")
+    print("  Re-read the current analysis with:")
+    print(
+        '    python -c "import boto3,json;print(json.dumps(boto3.client('
+        f"'bedrock-agentcore',region_name='{REGION}').get_ab_test(abTestId='{abtest_id}')"
+        '.get(\'results\'),indent=2,default=str))"'
+    )
+    print("  Console session counters are per session-evaluator pair: with the two evaluators")
+    print("  configured here they read twice the sample sizes above.")
+
+
+def _print_ab_decision(variant_result, control_sample_size):
+    """Print a rollout recommendation only where the sample can support one."""
+    percent = variant_result.get("percentChange")
+    direction = percent if percent is not None else variant_result.get("absoluteChange")
+    significant = variant_result.get("isSignificant")
+    arms = [n for n in (control_sample_size, variant_result.get("sampleSize")) if n is not None]
+    smallest = min(arms) if arms else None
+
+    if smallest is None:
+        print("    ACTION: none -- the analysis reported no sample sizes.")
+    elif smallest < AB_ACTION_MIN_SAMPLE_PER_ARM:
+        print(
+            f"    ACTION: none -- the smaller arm holds {smallest} sessions, below the "
+            f"{AB_ACTION_MIN_SAMPLE_PER_ARM}-session floor this script acts on."
+        )
+        print(f"      At this sample size significant={significant} is not evidence either way.")
+    elif significant and direction is not None and direction > 0:
+        print("    ACTION: treatment wins -- ramp to 50%, then cut over to 100%.")
+    elif significant and direction is not None and direction < 0:
+        print("    ACTION: treatment loses -- halt the rollout and investigate.")
+    else:
+        print("    ACTION: inconclusive -- keep sending traffic to accumulate sample size.")
+
+
+def wait_for_ab_analysis(abtest_id, traffic_ended, sessions_sent, control_label, treatment_label):
+    """Poll until the test publishes a settled analysis of its own traffic.
+
+    An analysis counts as settled once any of three things is true: it accounts
+    for every session this test sent, so nothing further can arrive; two
+    successive publications agree on the arm sizes; or the service has stopped
+    republishing. Analyses can be a quarter of an hour apart, so insisting on
+    the second of those alone would mean waiting out the whole budget on a
+    population that was already complete.
+
+    Returns (results, state), where state is one of:
+      "settled"   the population is complete, stable, or no longer changing
+      "unsettled" an analysis covering this traffic exists but is still growing
+      "none"      nothing usable was published within the polling budget
+    """
+    budget = AB_POLL_ATTEMPTS * AB_POLL_INTERVAL_SECONDS // 60
+    print(f"\nPolling for an A/B analysis of this test's traffic (up to ~{budget} minutes)...")
+    print("  Accepted once an analysis is published after the traffic finished and covers a")
+    print("  plausible share of it. Reported once its population stops changing.")
+
+    accepted = None
+    published = []
+    repeats = 0
+    for attempt in range(1, AB_POLL_ATTEMPTS + 1):
+        ab = dp.get_ab_test(abTestId=abtest_id)
+        results = ab.get("results") or {}
+        print(f"--- Poll {attempt}/{AB_POLL_ATTEMPTS} -- {time.strftime('%H:%M:%S')} ---")
+        _print_analysis(results, control_label, treatment_label)
+
+        usable, note = _analysis_covers_traffic(results, traffic_ended, sessions_sent)
+        if note:
+            print(f"  {note}")
+        if usable:
+            accepted = results
+            signature = _analysis_signature(results)
+            if published and published[-1][0] == signature[0]:
+                repeats += 1
+            else:
+                published.append(signature)
+                repeats = 0
+
+            if _analysis_session_count(results) == sessions_sent:
+                print(f"  All {sessions_sent} sessions sent are in the analysis -- settled.")
+                return results, "settled"
+            if len(published) >= 2 and published[-1][1] == published[-2][1]:
+                print("  Arm sizes unchanged across two published analyses -- settled.")
+                return results, "settled"
+            if repeats >= AB_SETTLE_QUIET_POLLS:
+                print(
+                    f"  No new analysis published in {repeats} polls -- treating as settled."
+                )
+                return results, "settled"
+            print("  Waiting to confirm the population has stopped changing.")
+
+        if attempt < AB_POLL_ATTEMPTS:
+            time.sleep(AB_POLL_INTERVAL_SECONDS)
+
+    return (accepted, "unsettled") if accepted else (None, "none")
+
+
+def report_ab_outcome(results, state, abtest_id, control_label, treatment_label):
+    """Report an analysis, labelled with how far it can be trusted."""
+    print()
+    if state == "none":
+        print("No analysis covering this test's traffic was published within the polling budget.")
+        print("That is a timing limit rather than a failure -- the analysis arrives later.")
+        _print_ab_followup(abtest_id)
+        return
+
+    if state == "unsettled":
+        print("Latest analysis covering this test's traffic -- STILL GROWING, not final:")
+    else:
+        print("Settled analysis of this test's traffic:")
+    _print_analysis(results, control_label, treatment_label, verbose=True)
+
+    print()
+    for metric in results.get("evaluatorMetrics", []):
+        name = metric.get("evaluatorArn", "").split("/")[-1]
+        control_n = metric.get("controlStats", {}).get("sampleSize")
+        for variant in metric.get("variantResults", []):
+            print(f"  {name}:")
+            _print_ab_decision(variant, control_n)
+    _print_ab_followup(abtest_id)
 
 
 def _save_state():
@@ -142,10 +402,19 @@ def _save_state():
             "target_id_v2": TARGET_ID_V2,
             "online_eval_id": ONLINE_EVAL_ID,
             "online_eval_v2_id": ONLINE_EVAL_V2_ID,
+            "online_eval_v1t_id": ONLINE_EVAL_V1T_ID,
             "abtest_bundle_id": ABTEST_BUNDLE_ID,
             "abtest_target_id": ABTEST_TARGET_ID,
             "delivery_id": DELIVERY_ID,
             "delivery_source_name": DELIVERY_SOURCE_NAME,
+            # Session IDs per phase. Each A/B analysis reports only aggregate
+            # sample sizes, so these are the only record of which sessions a
+            # given phase produced -- enough to check, from the online
+            # evaluation result records, whether an analysis population is
+            # actually this phase's traffic.
+            "baseline_session_ids": _g.get("baseline_session_ids"),
+            "bundle_session_ids": _g.get("gw_session_ids"),
+            "target_session_ids": _g.get("target_session_ids"),
         }
         state_file.write_text(json.dumps(state, indent=2))
         print(f"\nState saved to {state_file}")
@@ -245,6 +514,7 @@ def run_cleanup(state: dict):
     for oe_id, label in [
         (state.get("online_eval_id"), "v1"),
         (state.get("online_eval_v2_id"), "v2"),
+        (state.get("online_eval_v1t_id"), "v1-target"),
     ]:
         if not oe_id:
             continue
@@ -918,66 +1188,57 @@ for i, prompt in enumerate(GW_PROMPTS):
 
 print(f"\nGateway traffic: success={success}, fail={fail}")
 
-# 7f: Poll for A/B test results
-print("\nPolling for config-bundle A/B test results (up to 20 minutes)...")
-bundle_ab_results = None
-for poll in range(25):
-    ab = dp.get_ab_test(abTestId=ABTEST_BUNDLE_ID)
-    results = ab.get("results", {})
-    metrics = results.get("evaluatorMetrics", [])
-    print(f"--- Poll {poll + 1}/25 -- {time.strftime('%H:%M:%S')} ---")
-    print(f"  analysisTimestamp: {results.get('analysisTimestamp', 'none')}")
-    for m in metrics:
-        name = m.get("evaluatorArn", "").split("/")[-1]
-        cs = m.get("controlStats", {})
-        print(f"  {name}: Control mean={cs.get('mean', '-')}", end="")
-        for vr in m.get("variantResults", []):
-            pct = vr.get("percentChange")
-            if pct is None:
-                cm, vm = cs.get("mean"), vr.get("mean")
-                if cm and vm and float(cm) != 0:
-                    pct = (float(vm) - float(cm)) / float(cm) * 100
-            delta = f" change={pct:+.1f}%" if pct is not None else ""
-            print(f"  Treatment mean={vr.get('mean', '-')} p={vr.get('pValue', 'N/A')}{delta}")
-    if results.get("analysisTimestamp") and metrics:
-        bundle_ab_results = results
-        print("Results available!")
-        break
-    print()
-    time.sleep(60)
+# Anchor the result wait to the moment traffic finished, not the moment it
+# started: an analysis published while requests were still in flight cannot
+# contain the sessions that had not been sent yet.
+BUNDLE_TRAFFIC_ENDED = time.time()
+BUNDLE_SESSIONS_SENT = success
 
-# 7g: Promote treatment bundle if it won
-if bundle_ab_results:
-    for m in bundle_ab_results.get("evaluatorMetrics", []):
-        name = m.get("evaluatorArn", "").split("/")[-1]
-        cs_mean = m.get("controlStats", {}).get("mean")
-        for vr in m.get("variantResults", []):
-            sig = vr.get("isSignificant")
-            pct = vr.get("percentChange")
-            if pct is None and cs_mean and vr.get("mean") and float(cs_mean) != 0:
-                pct = (float(vr.get("mean")) - float(cs_mean)) / float(cs_mean) * 100
-            pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
-            print(f"\n  {name}: change={pct_str}  significant={sig}")
+# 7f: Wait for an analysis of this test's own traffic
+bundle_ab_results, bundle_ab_state = wait_for_ab_analysis(
+    ABTEST_BUNDLE_ID,
+    BUNDLE_TRAFFIC_ENDED,
+    BUNDLE_SESSIONS_SENT,
+    "control",
+    "treatment",
+)
+report_ab_outcome(bundle_ab_results, bundle_ab_state, ABTEST_BUNDLE_ID, "control", "treatment")
 
-    # Promote treatment config into control bundle
-    current = ctrl.get_configuration_bundle(bundleId=CONTROL_BUNDLE_ID)
-    CONTROL_BUNDLE_VERSION = current["versionId"]
-    promote_resp = ctrl.update_configuration_bundle(
-        bundleId=CONTROL_BUNDLE_ID,
-        components={
-            AGENT_ARN: {
-                "configuration": {
-                    "system_prompt": RECOMMENDED_SYSTEM_PROMPT,
-                    "tool_descriptions": RECOMMENDED_TOOL_DESCRIPTIONS,
-                }
+# 7g: Promote the treatment configuration into the control bundle
+#
+# The promotion runs unconditionally so the workshop always exercises the
+# versioning API, and the script states plainly what the measurement supported.
+# At workshop sample sizes it usually supports nothing, which is the honest
+# outcome: what follows demonstrates the promotion mechanism, not a validated
+# win.
+print("\n" + "=" * 60)
+print("STEP 7g: Promote the treatment configuration")
+print("=" * 60)
+if bundle_ab_state == "settled":
+    print("Promoting on a settled analysis. Read the ACTION lines above before trusting it.")
+elif bundle_ab_state == "unsettled":
+    print("Promoting on an analysis that had not settled. Illustrative only.")
+else:
+    print("Promoting without any analysis of this test's traffic. Illustrative only.")
+
+current = ctrl.get_configuration_bundle(bundleId=CONTROL_BUNDLE_ID)
+CONTROL_BUNDLE_VERSION = current["versionId"]
+promote_resp = ctrl.update_configuration_bundle(
+    bundleId=CONTROL_BUNDLE_ID,
+    components={
+        AGENT_ARN: {
+            "configuration": {
+                "system_prompt": RECOMMENDED_SYSTEM_PROMPT,
+                "tool_descriptions": RECOMMENDED_TOOL_DESCRIPTIONS,
             }
-        },
-        parentVersionIds=[CONTROL_BUNDLE_VERSION],
-        commitMessage="Promote treatment: AI-recommended prompt + tool descriptions (A/B validated)",
-        clientToken=str(uuid.uuid4()),
-    )
-    CONTROL_BUNDLE_VERSION_V2 = promote_resp["versionId"]
-    print(f"\nControl bundle promoted to version: {CONTROL_BUNDLE_VERSION_V2}")
+        }
+    },
+    parentVersionIds=[CONTROL_BUNDLE_VERSION],
+    commitMessage="Promote treatment: AI-recommended prompt + tool descriptions",
+    clientToken=str(uuid.uuid4()),
+)
+CONTROL_BUNDLE_VERSION_V2 = promote_resp["versionId"]
+print(f"\nControl bundle promoted to version: {CONTROL_BUNDLE_VERSION_V2}")
 
 # ── Step 8: A/B test — target-based routing ───────────────────────────────
 
@@ -1059,6 +1320,41 @@ ONLINE_EVAL_V2_ID = online_eval_v2_resp["onlineEvaluationConfigId"]
 ONLINE_EVAL_V2_ARN = online_eval_v2_resp["onlineEvaluationConfigArn"]
 print(f"v2 online eval config: {ONLINE_EVAL_V2_ID}")
 
+# 8c-2: Create a fresh online evaluation config for the control arm.
+#
+# The step 7 config (ONLINE_EVAL_ARN) has been enabled since before the
+# baseline traffic and the config-bundle A/B test, so it has already ingested
+# those sessions. Wiring it into the control arm here would start the canary
+# with a pre-loaded control population while the treatment arm begins empty,
+# so the two arms would cover different time windows and the comparison would
+# not be like-for-like. It also lets the service publish an analysis built
+# entirely from pre-canary sessions within seconds of the test starting.
+# Create a config that begins at the same moment as the v2 one instead.
+online_eval_v1t_resp = ctrl.create_online_evaluation_config(
+    onlineEvaluationConfigName=f"HROnlineEvalV1T{SUFFIX}",
+    description="HR Assistant v1 online evaluation (target-based routing control arm)",
+    dataSourceConfig={
+        "cloudWatchLogs": {
+            "logGroupNames": [LOG_GROUP],
+            "serviceNames": [SERVICE_NAME],
+        }
+    },
+    evaluators=[
+        {"evaluatorId": "Builtin.GoalSuccessRate"},
+        {"evaluatorId": "Builtin.Helpfulness"},
+    ],
+    rule={
+        "samplingConfig": {"samplingPercentage": 100.0},
+        "sessionConfig": {"sessionTimeoutMinutes": 2},
+    },
+    evaluationExecutionRoleArn=ROLE_ARN,
+    enableOnCreate=True,
+    clientToken=str(uuid.uuid4()),
+)
+ONLINE_EVAL_V1T_ID = online_eval_v1t_resp["onlineEvaluationConfigId"]
+ONLINE_EVAL_V1T_ARN = online_eval_v1t_resp["onlineEvaluationConfigArn"]
+print(f"v1 control-arm online eval config: {ONLINE_EVAL_V1T_ID}")
+
 # 8d: Stop bundle A/B test and create target-based A/B test
 print("Stopping config-bundle A/B test...")
 try:
@@ -1081,7 +1377,7 @@ abtest_target_resp = dp.create_ab_test(
     enableOnCreate=True,
     evaluationConfig={
         "perVariantOnlineEvaluationConfig": [
-            {"name": "C", "onlineEvaluationConfigArn": ONLINE_EVAL_ARN},
+            {"name": "C", "onlineEvaluationConfigArn": ONLINE_EVAL_V1T_ARN},
             {"name": "T1", "onlineEvaluationConfigArn": ONLINE_EVAL_V2_ARN},
         ]
     },
@@ -1116,7 +1412,22 @@ for i in range(30):
 print(f"\n90% -> {TARGET_NAME} (v1)   10% -> {TARGET_NAME_V2} (v2 canary)")
 
 # 8e: Send traffic
-GW_INVOKE_URL_V2 = f"{GATEWAY_URL}/{TARGET_NAME_V2}/invocations"
+#
+# All traffic goes to the A/B test's filtered path (/{TARGET_NAME}/*) and the
+# service applies the 90/10 variant weights. Addressing the v2 target directly
+# would bypass gatewayFilter, so those sessions would never enter the
+# experiment and the configured weights would never route anything -- the
+# split you observe would just be whatever the client chose.
+#
+# A 10% canary arm only collects a usable statistical sample from a large
+# number of sessions, which a workshop run cannot afford to send: at
+# TARGET_AB_SESSIONS=20 the treatment arm receives roughly 2. The canary split
+# is kept realistic and the sample is openly illustrative -- the script reports
+# the arm sizes and withholds any rollout recommendation below
+# AB_ACTION_MIN_SAMPLE_PER_ARM, rather than reading significance into 2
+# sessions. Raise this if you want the significance test to carry weight.
+TARGET_AB_SESSIONS = 20
+
 TARGET_PROMPTS = [
     "Employee ID: EMP-001. Check my PTO balance and submit a request for 2026-11-24 to 2026-11-28.",
     "Employee ID: EMP-042. I have a payroll dispute. Can you escalate this to an HR manager?",
@@ -1131,9 +1442,12 @@ TARGET_PROMPTS = [
 ]
 
 success, fail = 0, 0
-for i, prompt in enumerate(TARGET_PROMPTS):
+target_session_ids = []
+for i in range(TARGET_AB_SESSIONS):
+    prompt = TARGET_PROMPTS[i % len(TARGET_PROMPTS)]
     sid = str(uuid.uuid4())
-    invoke_url = GW_INVOKE_URL if i % 2 == 0 else GW_INVOKE_URL_V2
+    target_session_ids.append(sid)
+    invoke_url = GW_INVOKE_URL
     body = json.dumps({"prompt": prompt, "sessionId": sid})
     req = AWSRequest(
         method="POST",
@@ -1160,47 +1474,18 @@ for i, prompt in enumerate(TARGET_PROMPTS):
 
 print(f"\nTarget traffic: success={success}, fail={fail}")
 
-# 8f: Poll for target A/B results
-print("\nPolling for target-based A/B test results (up to 20 minutes)...")
-for poll in range(25):
-    ab = dp.get_ab_test(abTestId=ABTEST_TARGET_ID)
-    results = ab.get("results", {})
-    metrics = results.get("evaluatorMetrics", [])
-    print(f"--- Poll {poll + 1}/25 -- {time.strftime('%H:%M:%S')} ---")
-    print(f"  analysisTimestamp: {results.get('analysisTimestamp', 'none')}")
-    for m in metrics:
-        name = m.get("evaluatorArn", "").split("/")[-1]
-        cs = m.get("controlStats", {})
-        print(f"  {name}: v1 mean={cs.get('mean', '-')}", end="")
-        for vr in m.get("variantResults", []):
-            pct = vr.get("percentChange")
-            if pct is None:
-                cm, vm = cs.get("mean"), vr.get("mean")
-                if cm and vm and float(cm) != 0:
-                    pct = (float(vm) - float(cm)) / float(cm) * 100
-            delta = f" change={pct:+.1f}%" if pct is not None else ""
-            print(f"  v2 mean={vr.get('mean', '-')} p={vr.get('pValue', 'N/A')}{delta}")
-    if results.get("analysisTimestamp") and metrics:
-        print("Target A/B results available!")
-        for m in metrics:
-            name = m.get("evaluatorArn", "").split("/")[-1]
-            cs_mean = m.get("controlStats", {}).get("mean")
-            for vr in m.get("variantResults", []):
-                sig = vr.get("isSignificant")
-                pct = vr.get("percentChange")
-                if pct is None and cs_mean and vr.get("mean") and float(cs_mean) != 0:
-                    pct = (float(vr.get("mean")) - float(cs_mean)) / float(cs_mean) * 100
-                pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
-                print(f"  {name}: change={pct_str}  significant={sig}")
-                if sig and pct is not None and pct > 0:
-                    print("    ACTION: Ramp to 50%, then 100% cutover to v2")
-                elif sig and pct is not None and pct < 0:
-                    print("    ACTION: Halt rollout; keep v1, investigate v2")
-                else:
-                    print("    ACTION: Continue sending traffic to accumulate sample size")
-        break
-    print()
-    time.sleep(60)
+TARGET_TRAFFIC_ENDED = time.time()
+TARGET_SESSIONS_SENT = success
+
+# 8f: Wait for an analysis of the canary's own traffic
+target_ab_results, target_ab_state = wait_for_ab_analysis(
+    ABTEST_TARGET_ID,
+    TARGET_TRAFFIC_ENDED,
+    TARGET_SESSIONS_SENT,
+    "v1 (C)",
+    "v2 (T1)",
+)
+report_ab_outcome(target_ab_results, target_ab_state, ABTEST_TARGET_ID, "v1 (C)", "v2 (T1)")
 
 print("\n" + "=" * 60)
 print("Optimization workflow complete.")
